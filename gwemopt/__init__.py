@@ -20,7 +20,11 @@
 """Gravitational-wave Electromagnetic Optimization
 """
 
-__author__ = 'Michael Coughlin <michael.coughlin@ligo.org>'
-from ._version import get_versions
-__version__ = get_versions()['version']
-del get_versions
+__author__ = "Michael Coughlin <michael.coughlin@ligo.org>"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("gwemopt")
+except PackageNotFoundError:
+    # package is not installed
+    pass

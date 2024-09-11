@@ -1,167 +1,158 @@
-import time
 import copy
+import os
 
-from mocpy import MOC
-from astropy.table import Table
-from joblib import Parallel, delayed
+import astropy.units as u
 import healpy as hp
 import numpy as np
+import regions
+from astropy.coordinates import SkyCoord
+from joblib import Parallel, delayed
+from mocpy import MOC
+from tqdm import tqdm
 
-import shapely.geometry
-
-import gwemopt.utils
 import gwemopt.tiles
-import gwemopt.ztf_tiling
-import gwemopt.decam_tiling
+from gwemopt.chipgaps import get_decam_quadrant_moc, get_ztf_quadrant_moc
+from gwemopt.paths import CONFIG_DIR
+from gwemopt.utils.parallel import tqdm_joblib
+from gwemopt.utils.pixels import get_region_moc
 
-def create_moc(params, map_struct=None):
 
+def construct_moc(params, config_struct, telescope, tesselation):
+
+    if params["doParallel"]:
+        n_threads = params["Ncores"]
+    else:
+        n_threads = None
+
+    if params["doChipGaps"]:
+        if telescope == "ZTF":
+            mocs = get_ztf_quadrant_moc(
+                tesselation[:, 1], tesselation[:, 2], n_threads=n_threads
+            )
+        elif telescope == "DECam":
+            mocs = get_decam_quadrant_moc(
+                tesselation[:, 1], tesselation[:, 2], n_threads=n_threads
+            )
+        else:
+            raise ValueError("Chip gaps only available for DECam and ZTF")
+
+    else:
+        if config_struct["FOV_type"] == "circle":
+            mocs = MOC.from_cones(
+                lon=tesselation[:, 1] * u.deg,
+                lat=tesselation[:, 2] * u.deg,
+                radius=config_struct["FOV"] * u.deg,
+                max_depth=np.uint8(10),
+                n_threads=n_threads,
+            )
+        elif config_struct["FOV_type"] == "square":
+            mocs = MOC.from_boxes(
+                lon=tesselation[:, 1] * u.deg,
+                lat=tesselation[:, 2] * u.deg,
+                a=config_struct["FOV"] * u.deg,
+                b=config_struct["FOV"] * u.deg,
+                angle=0 * u.deg,
+                max_depth=np.uint8(10),
+                n_threads=n_threads,
+            )
+        elif config_struct["FOV_type"] == "region":
+            region_file = os.path.join(CONFIG_DIR, config_struct["FOV"])
+            region = regions.Regions.read(region_file, format="ds9")
+            mocs = get_region_moc(
+                tesselation[:, 1], tesselation[:, 2], region, n_threads=n_threads
+            )
+
+    return {
+        tess[0].astype(int): {"ra": tess[1], "dec": tess[2], "moc": mocs[ii]}
+        for ii, tess in enumerate(tesselation)
+    }
+
+
+def create_moc(params, map_struct=None, field_ids=None, from_skyportal=False):
     nside = params["nside"]
-    npix = hp.nside2npix(nside)
-
-    if params["doMinimalTiling"]:
-        prob = map_struct["prob"]
-
-        n, cl, dist_exp = params["powerlaw_n"], params["powerlaw_cl"], params["powerlaw_dist_exp"]
-        prob_scaled = copy.deepcopy(prob)
-        prob_sorted = np.sort(prob_scaled)[::-1]
-        prob_indexes = np.argsort(prob_scaled)[::-1]
-        prob_cumsum = np.cumsum(prob_sorted)
-        index = np.argmin(np.abs(prob_cumsum - cl)) + 1
-        prob_indexes = prob_indexes[:index+1]
-
-    if "doUsePrimary" in params:
-        doUsePrimary = params["doUsePrimary"]
-    else:
-        doUsePrimary = False
-
-    if "doUseSecondary" in params:
-        doUseSecondary = params["doUseSecondary"]
-    else:
-        doUseSecondary = False
 
     moc_structs = {}
     for telescope in params["telescopes"]:
         config_struct = params["config"][telescope]
         tesselation = config_struct["tesselation"]
-        moc_struct = {}
 
-        if params["doMinimalTiling"] and (config_struct["FOV"] < 1.0):
-            idxs = hp.pixelfunc.ang2pix(map_struct["nside"], tesselation[:,1], tesselation[:,2], lonlat=True)
-            isin = np.isin(idxs, prob_indexes)
-  
-            idxs = [i for i, x in enumerate(isin) if x] 
-            print("Keeping %d/%d tiles" % (len(idxs), len(tesselation)))
-            tesselation = tesselation[idxs,:]
-
-        if params["doParallel"]:
-            moclists = Parallel(n_jobs=params["Ncores"])(delayed(Fov2Moc)(params, config_struct, telescope, tess[1], tess[2], nside) for tess in tesselation)
+        if from_skyportal:
+            moc_struct = {}
+            mocs = []
             for ii, tess in enumerate(tesselation):
-                index, ra, dec = tess[0], tess[1], tess[2]
-                if (telescope == "ZTF") and doUsePrimary and (index > 880):
+                if field_ids is not None:
+                    if tess.field_id not in field_ids[telescope]:
+                        mocs.append(MOC.new_empty(29))
+                        continue
+                ranges = np.array(
+                    [(tile.healpix.lower, tile.healpix.upper) for tile in tess.tiles]
+                )
+                moc = MOC.from_depth29_ranges(10, ranges)
+                mocs.append(moc)
+            for ii, tess in enumerate(tesselation):
+                index = tess.field_id
+
+                if (telescope == "ZTF") and params["doUsePrimary"] and (index > 880):
                     continue
-                if (telescope == "ZTF") and doUseSecondary and (index < 1000):
+                if (telescope == "ZTF") and params["doUseSecondary"] and (index < 1000):
                     continue
-                moc_struct[index] = moclists[ii]    
+
+                moc = mocs[ii]
+                if moc.empty():
+                    continue
+
+                moc_struct[index] = {}
+                moc_struct[index]["ra"] = tess.ra
+                moc_struct[index]["dec"] = tess.dec
+                moc_struct[index]["moc"] = moc
+
         else:
-            for ii, tess in enumerate(tesselation):
-                index, ra, dec = tess[0], tess[1], tess[2]
-                if (telescope == "ZTF") and doUsePrimary and (index > 880):
-                    continue
-                if (telescope == "ZTF") and doUseSecondary and (index < 1000):
-                    continue
-                index = index.astype(int)
-                moc_struct[index] = Fov2Moc(params, config_struct, telescope, ra, dec, nside)
+            if (telescope == "ZTF") and params["doUsePrimary"]:
+                idx = np.where(tesselation[:, 0] <= 880)[0]
+                tesselation = tesselation[idx, :]
+            elif (telescope == "ZTF") and params["doUseSecondary"]:
+                idx = np.where(tesselation[:, 0] >= 1000)[0]
+                tesselation = tesselation[idx, :]
 
+            moc_struct = construct_moc(params, config_struct, telescope, tesselation)
         if map_struct is not None:
-             ipix_keep = map_struct["ipix_keep"]
+            moc_keep = map_struct["moc_keep"]
         else:
-            ipix_keep = []
+            moc_keep = None
+
         if params["doMinimalTiling"]:
             moc_struct_new = copy.copy(moc_struct)
             if params["tilesType"] == "galaxy":
-                tile_probs = gwemopt.tiles.compute_tiles_map(params, moc_struct_new, prob, func='center', ipix_keep=ipix_keep)
+                tile_probs = gwemopt.tiles.compute_tiles_map(
+                    params,
+                    moc_struct_new,
+                    map_struct["skymap"],
+                    func="center",
+                    moc_keep=moc_keep,
+                )
             else:
-                tile_probs = gwemopt.tiles.compute_tiles_map(params, moc_struct_new, prob, func='np.sum(x)', ipix_keep=ipix_keep)
+                tile_probs = gwemopt.tiles.compute_tiles_map(
+                    params,
+                    moc_struct_new,
+                    map_struct["skymap"],
+                    func="np.sum(x)",
+                    moc_keep=moc_keep,
+                )
 
             keys = moc_struct.keys()
 
             sort_idx = np.argsort(tile_probs)[::-1]
             csm = np.empty(len(tile_probs))
             csm[sort_idx] = np.cumsum(tile_probs[sort_idx])
-            ipix_keep = np.where(csm <= cl)[0]
+            tiles_keep = np.where(csm <= params["confidence_level"])[0]
 
-            probs = []
             moc_struct = {}
             cnt = 0
             for ii, key in enumerate(keys):
-                if ii in ipix_keep:
+                if ii in tiles_keep:
                     moc_struct[key] = moc_struct_new[key]
                     cnt = cnt + 1
 
         moc_structs[telescope] = moc_struct
 
     return moc_structs
-
-def Fov2Moc(params, config_struct, telescope, ra_pointing, dec_pointing, nside):
-    """Return a MOC in fits file of a fov footprint.
-       The MOC fov is displayed in real time in an Aladin plan.
-
-       Input:
-           ra--> right ascention of fov center [deg]
-           dec --> declination of fov center [deg]
-           fov_width --> fov width [deg]
-           fov_height --> fov height [deg]
-           nside --> healpix resolution; by default 
-           """
-
-    moc_struct = {}
-   
-    if "rotation" in params:
-        rotation=params["rotation"]
-    else:
-        rotation=None
- 
-    if config_struct["FOV_type"] == "square": 
-        ipix, radecs, patch, area = gwemopt.utils.getSquarePixels(ra_pointing, dec_pointing, config_struct["FOV"], nside, rotation=rotation)
-    elif config_struct["FOV_type"] == "circle":
-        ipix, radecs, patch, area = gwemopt.utils.getCirclePixels(ra_pointing, dec_pointing, config_struct["FOV"], nside, rotation=rotation)
-
-    if params["doChipGaps"]:
-        if telescope == "ZTF":
-            ipixs = gwemopt.ztf_tiling.get_quadrant_ipix(nside, ra_pointing, dec_pointing)
-            ipix = list({y for x in ipixs for y in x})
-        elif telescope == "DECam":
-            ipixs = gwemopt.decam_tiling.get_quadrant_ipix(nside, ra_pointing, dec_pointing)
-            ipix = list({y for x in ipixs for y in x})
-        #else:
-        #    print("Requested chip gaps with non-ZTF detector, will use moc.")
-
-    moc_struct["ra"] = ra_pointing
-    moc_struct["dec"] = dec_pointing
-    moc_struct["ipix"] = ipix
-    moc_struct["corners"] = radecs
-    moc_struct["patch"] = patch
-    moc_struct["area"] = area
-
-    if False:
-    #if len(ipix) > 0:
-        # from index to polar coordinates
-        theta, phi = hp.pix2ang(nside, ipix)
-
-        # converting these to right ascension and declination in degrees
-        ra = np.rad2deg(phi)
-        dec = np.rad2deg(0.5 * np.pi - theta)
-
-        box_ipix = Table([ra, dec], names = ('RA[deg]', 'DEC[deg]'),
-                 meta = {'ipix': 'ipix table'})
-
-        moc_order = int(np.log(nside)/ np.log(2))
-        moc = MOC.from_table( box_ipix, 'RA[deg]', 'DEC[deg]', moc_order )
-
-        moc_struct["moc"] = moc
-    else:
-        moc_struct["moc"] = []
-
-    return moc_struct
-
